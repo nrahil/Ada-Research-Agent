@@ -3,13 +3,16 @@
 """
 
 import time
+import logging
 import re
 import socket
 import ipaddress
 import requests
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Callable
 from urllib.parse import urljoin, urlparse
 import trafilatura
+
+logger = logging.getLogger(__name__)
 
 # Standard desktop User-Agent
 DEFAULT_HEADERS = {
@@ -61,7 +64,11 @@ def clean_markdown_content(raw_text: str) -> str:
     cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
     return cleaned.strip()
 
-def scrape_webpage(url: str, timeout: int = 12) -> Dict[str, Any]:
+def scrape_webpage(
+    url: str,
+    timeout: int = 8,
+    cancel_check: Optional[Callable[[], bool]] = None,
+) -> Dict[str, Any]:
     """
     Fetches only validated public URLs, follows at most four independently
     validated redirects, and caps response size. Search snippets remain the
@@ -69,9 +76,25 @@ def scrape_webpage(url: str, timeout: int = 12) -> Dict[str, Any]:
     """
     domain = urlparse(url).netloc.replace("www.", "")
     t0 = time.time()
+    deadline = time.monotonic() + max(1, timeout)
+
+    def cancelled_result(method: str) -> Dict[str, Any]:
+        """Return an empty retrieval result when cancellation/deadline interrupts a fetch."""
+        return {
+            "url": url,
+            "domain": domain,
+            "title": f"Source {domain}",
+            "text": "",
+            "method": method,
+            "latency": round(time.time() - t0, 2),
+            "char_count": 0,
+        }
+
+    if cancel_check and cancel_check():
+        return cancelled_result("cancelled")
 
     if not is_safe_public_url(url):
-        print(f"[scraper] Blocked unsafe/non-public URL: {url}")
+        logger.warning("Blocked unsafe or non-public URL during source retrieval")
         return {
             "url": url,
             "domain": domain,
@@ -87,12 +110,17 @@ def scrape_webpage(url: str, timeout: int = 12) -> Dict[str, Any]:
         current_url = url
         response = None
         for _ in range(5):
+            remaining = deadline - time.monotonic()
+            if (cancel_check and cancel_check()) or remaining <= 0:
+                if response is not None:
+                    response.close()
+                return cancelled_result("cancelled" if cancel_check and cancel_check() else "timeout")
             if not is_safe_public_url(current_url):
                 return {"url": url, "domain": domain, "title": f"Blocked redirect from {domain}", "text": "", "method": "blocked_redirect", "latency": round(time.time() - t0, 2), "char_count": 0}
             response = requests.get(
                 current_url,
                 headers=DEFAULT_HEADERS,
-                timeout=(4, timeout),
+                timeout=(min(2.0, remaining), min(3.0, remaining)),
                 allow_redirects=False,
                 stream=True,
             )
@@ -108,6 +136,9 @@ def scrape_webpage(url: str, timeout: int = 12) -> Dict[str, Any]:
         if response is not None and response.status_code == 200:
             content = bytearray()
             for chunk in response.iter_content(chunk_size=65536):
+                if (cancel_check and cancel_check()) or time.monotonic() >= deadline:
+                    response.close()
+                    return cancelled_result("cancelled" if cancel_check and cancel_check() else "timeout")
                 content.extend(chunk)
                 if len(content) > 5 * 1024 * 1024:
                     break
@@ -139,8 +170,8 @@ def scrape_webpage(url: str, timeout: int = 12) -> Dict[str, Any]:
                     "latency": round(time.time() - t0, 2),
                     "char_count": len(extracted)
                 }
-    except Exception as e:
-        print(f"[scraper] Tier 1 Trafilatura bypassed for {url}: {e}")
+    except Exception:
+        logger.warning("Page retrieval failed; the worker may use its search snippet fallback")
 
     # Return empty so the worker can use the provider's search snippet.
     return {

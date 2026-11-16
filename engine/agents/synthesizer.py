@@ -2,12 +2,11 @@
 
 """
 
-import os
-import re
 import html
+import logging
 from typing import List, Dict, Any, Optional
-import google.generativeai as genai
-from engine.config import GEMINI_API_KEY, GEMINI_SYNTHESIS_MODEL
+
+logger = logging.getLogger(__name__)
 
 SYNTHESIZER_SYSTEM_INSTRUCTION = """You are the Chief Intelligence Analyst and Synthesizer of Ada Deep Research.
 Your objective is to craft an exhaustive, publication-grade, deeply analytical research dossier on the requested topic.
@@ -47,7 +46,7 @@ def format_evidence_xml(manifest: List[Dict[str, Any]]) -> str:
         sid = ev.get("source_id", "S?")
         stype = ev.get("source_type", "web")
         title = html.escape(ev.get("title", "Untitled Source"))
-        auth = ev.get("authority_score", 0.7)
+        auth = ev.get("authority_score")
 
         if stype == "user_doc":
             dname = html.escape(ev.get("doc_name", "User Doc"))
@@ -103,7 +102,7 @@ VERIFIED EVIDENCE CORPUS ({len(evidence_manifest)} Sources):
 Synthesize the definitive, publication-grade research report on this topic. Ensure heavy, accurate citation coverage using [Sx] and [Dx] notation throughout the text.
 """
 
-    print(f"[synthesizer] Prompting Gateway write group with {len(evidence_manifest)} sources (~{len(evidence_xml)//4} tokens)...")
+    logger.info("Synthesizing report from %s evidence sources", len(evidence_manifest))
 
     messages = [
         {"role": "system", "content": SYNTHESIZER_SYSTEM_INSTRUCTION},

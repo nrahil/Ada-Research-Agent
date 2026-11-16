@@ -3,11 +3,11 @@
 """
 
 import json
+import logging
 import re
 from typing import List, Dict, Any, Optional
-from groq import Groq
-from engine.config import GROQ_API_KEY, GROQ_PLANNER_MODEL
 
+logger = logging.getLogger(__name__)
 CRITIC_SYSTEM_PROMPT = """You are the Lead Adversarial Critic and Auditor of an autonomous deep research engine.
 Your mission is to rigorously evaluate the gathered evidence for a research investigation.
 
@@ -53,7 +53,7 @@ def audit_research_evidence(
     for idx, ev in enumerate(evidence_manifest[:18], 1):
         source_label = ev.get("source_id", f"S{idx}")
         title = ev.get("title", "Untitled")
-        auth = ev.get("authority_score", 0.7)
+        auth = ev.get("authority_score")
         # Compact excerpt
         excerpt = ev.get("text", "")[:350].replace("\n", " ")
         evidence_summary.append(f"[{source_label}] (Authority {auth}) {title}\n  Summary: {excerpt}...")
@@ -90,19 +90,17 @@ Conduct an adversarial audit. Identify gaps, check for conflicting metrics or ti
                 clean_json = re.sub(r',\s*([\]\}])', r'\1', raw_json)
                 audit = json.loads(clean_json)
                 return audit
-        except Exception as e:
-            print(f"[critic] Critic LLM parse error ({e}). Returning baseline audit.")
+        except Exception:
+            logger.warning("Critic response could not be parsed; returning the unavailable audit")
 
-    # Resilient fallback audit
+    # Do not invent gaps or arbiter queries when the audit model is unavailable.
     return {
-        "coverage_quality": "moderate",
-        "coverage_score": 75,
-        "identified_gaps": ["Long-term lifecycle and recycling considerations require further empirical corroboration."],
+        "status": "unavailable",
+        "coverage_quality": "unavailable",
+        "coverage_score": None,
+        "identified_gaps": [],
         "contradictions": [],
-        "arbiter_queries": [f"{query} environmental lifecycle and recycling viability"],
-        "suggested_next_inquiries": [
-            f"What are the major operational bottlenecks in {query}?",
-            f"How does {query} compare with competing alternative methodologies?",
-            f"What is the projected economic scaling cost for {query}?"
-        ]
+        "arbiter_queries": [],
+        "suggested_next_inquiries": [],
+        "warning": "Evidence critique was unavailable; no gap or contradiction findings were inferred.",
     }

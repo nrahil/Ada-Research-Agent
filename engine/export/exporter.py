@@ -2,13 +2,15 @@
 
 """
 
-import os
 import re
 import json
 import html
 import uuid
+import logging
 from pathlib import Path
 from typing import Dict, Any, List, Optional
+
+logger = logging.getLogger(__name__)
 
 DOSSIER_DIR = Path("dossiers")
 
@@ -111,6 +113,8 @@ def export_research_dossier(
     evidence_manifest: List[Dict[str, Any]],
     report_id: Optional[str] = None,
     scores: Optional[Dict[str, Any]] = None,
+    research_warnings: Optional[List[str]] = None,
+    budget_usage: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, str]:
     """
     Exports the dossier in Markdown, JSON, and standalone HTML formats.
@@ -132,13 +136,14 @@ def export_research_dossier(
 
     # 2. Export Structured JSON
     json_filename = DOSSIER_DIR / f"dossier_{rid}.json"
+    coverage_score = (scores or {}).get("coverage")
     full_payload = {
         "report_id": rid,
         "query": query,
         "executive_title": exec_title,
         "faithfulness_score": guard_results.get("faithfulness_score"),
         "citation_validity_score": guard_results.get("citation_validity_score"),
-        "coverage_score": round((scores or {}).get("coverage") * 100) if (scores or {}).get("coverage") is not None else None,
+        "coverage_score": round(float(coverage_score) * 100) if coverage_score is not None else None,
         "scores": scores or {},
         "guard_results": guard_results,
         "claims": guard_results.get("claims", []),
@@ -148,7 +153,9 @@ def export_research_dossier(
         "critic_audit": critic_audit,
         "citation_index": guard_results.get("citation_index", {}),
         "evidence_manifest": evidence_manifest,
-        "suggested_inquiries": critic_audit.get("suggested_next_inquiries", [])
+        "suggested_inquiries": critic_audit.get("suggested_next_inquiries", []),
+        "research_warnings": research_warnings or [],
+        "budget_usage": budget_usage,
     }
     with open(json_filename, "w", encoding="utf-8") as f:
         json.dump(full_payload, f, indent=2)
@@ -161,7 +168,8 @@ def export_research_dossier(
         safe_title = html.escape(str(sinfo.get("title", "Untitled")), quote=True)
         raw_url = str(sinfo.get("url") or "")
         safe_snippet = html.escape(str(sinfo.get("snippet", "")), quote=True)
-        safe_auth = html.escape(str(sinfo.get("authority_score", 0.7)), quote=True)
+        auth = sinfo.get("authority_score")
+        safe_auth = html.escape(f"Heuristic authority estimate: {float(auth):.2f}" if auth is not None else "Authority not measured", quote=True)
 
         if raw_url.startswith(("http://", "https://")):
             safe_url = html.escape(raw_url, quote=True)
@@ -174,7 +182,7 @@ def export_research_dossier(
         sources_html_items.append(
             f"<div class='source-box'>"
             f"<div class='source-title'>[{safe_sid}] {safe_title}</div>"
-            f"<div class='source-meta'>{url_link} | Authority: {safe_auth}</div>"
+            f"<div class='source-meta'>{url_link} | {safe_auth}</div>"
             f"<p style='font-size:0.85rem; color:#4b5563; margin-top:6px;'>{safe_snippet}...</p>"
             f"</div>"
         )
@@ -194,7 +202,7 @@ def export_research_dossier(
     with open(html_filename, "w", encoding="utf-8") as f:
         f.write(rendered_html)
 
-    print(f"[exporter] Exported dossier {rid} to:\n  - {md_filename}\n  - {json_filename}\n  - {html_filename}")
+    logger.info("Exported report artifacts for run %s", rid)
     return {
         "report_id": rid,
         "executive_title": exec_title,

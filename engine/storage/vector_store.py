@@ -2,8 +2,8 @@
 
 """
 
-import os
 import uuid
+import logging
 import threading
 from typing import List, Dict, Any, Optional
 from pathlib import Path
@@ -11,6 +11,8 @@ from qdrant_client import QdrantClient
 from qdrant_client.http import models
 from fastembed import TextEmbedding
 from engine.config import QDRANT_COLLECTION, QDRANT_STORAGE_PATH, QDRANT_URL, QDRANT_API_KEY, EMBEDDING_MODEL_NAME
+
+logger = logging.getLogger(__name__)
 
 class AdaVectorStore:
     """
@@ -33,28 +35,28 @@ class AdaVectorStore:
         self.vector_size = 384  # bge-small-en-v1.5 dimension
         
         # Initialize FastEmbed Embedding Model
-        print(f"[vector_store] Loading FastEmbed model ({EMBEDDING_MODEL_NAME})...")
+        logger.info("Loading document embedding model %s", EMBEDDING_MODEL_NAME)
         self.embed_model = TextEmbedding(model_name=EMBEDDING_MODEL_NAME)
 
-        # Initialize Qdrant Client (Remote HTTP/Cloud -> Local disk -> In-memory fallback)
-        self.client = None
+        # Prefer the configured service and fall back to durable local storage.
+        client: Optional[QdrantClient] = None
         if QDRANT_URL:
             try:
-                print(f"[vector_store] Connecting to Qdrant service at {QDRANT_URL}...")
+                logger.info("Connecting to configured Qdrant service")
                 candidate = QdrantClient(
                     url=QDRANT_URL,
                     api_key=QDRANT_API_KEY or None,
                     timeout=10,
                 )
                 candidate.get_collections()
-                self.client = candidate
-            except Exception as e:
-                print(f"[vector_store] Qdrant service unreachable ({e}); falling back to local path...")
+                client = candidate
+            except Exception:
+                logger.warning("Qdrant service is unavailable; trying local persistent storage")
 
-        if self.client is None:
+        if client is None:
             Path(QDRANT_STORAGE_PATH).mkdir(parents=True, exist_ok=True)
             try:
-                self.client = QdrantClient(path=QDRANT_STORAGE_PATH)
+                client = QdrantClient(path=QDRANT_STORAGE_PATH)
             except Exception as e:
                 raise RuntimeError(
                     f"Persistent Qdrant storage at '{QDRANT_STORAGE_PATH}' is unavailable or locked. "
@@ -62,6 +64,7 @@ class AdaVectorStore:
                     "Ada will not silently use an empty in-memory index."
                 ) from e
 
+        self.client: QdrantClient = client
         self._ensure_collection()
 
     def _ensure_collection(self):
@@ -76,7 +79,7 @@ class AdaVectorStore:
                         distance=models.Distance.COSINE
                     )
                 )
-                print(f"[vector_store] Created collection: {self.collection_name}")
+                logger.info("Created Qdrant collection %s", self.collection_name)
         except Exception as e:
             raise RuntimeError(f"Could not initialize Qdrant collection '{self.collection_name}'.") from e
 
@@ -125,7 +128,7 @@ class AdaVectorStore:
             collection_name=self.collection_name,
             points=points
         )
-        print(f"[vector_store] Indexed {len(points)} private document chunks into Qdrant.")
+        logger.info("Indexed %s private document chunks", len(points))
         return len(points)
 
     def search_user_docs(
@@ -144,7 +147,7 @@ class AdaVectorStore:
             return []
         query_vector = self.embed_texts([query])[0]
         
-        must_conditions = [
+        must_conditions: List[models.Condition] = [
             models.FieldCondition(
                 key="source_type",
                 match=models.MatchValue(value="user_doc")
@@ -179,16 +182,15 @@ class AdaVectorStore:
 
         matches = []
         for hit in response.points:
+            payload = hit.payload or {}
             matches.append({
                 "score": round(hit.score, 4),
-                "chunk_id": hit.payload.get("chunk_id"),
-                "chunk_index": hit.payload.get("chunk_index"),
-                "section_path": hit.payload.get("section_path"),
-                "doc_name": hit.payload.get("doc_name"),
-                "page_number": hit.payload.get("page_number"),
-                "section_path": hit.payload.get("section_path"),
-                "chunk_index": hit.payload.get("chunk_index"),
-                "text": hit.payload.get("text"),
+                "chunk_id": payload.get("chunk_id"),
+                "chunk_index": payload.get("chunk_index"),
+                "section_path": payload.get("section_path"),
+                "doc_name": payload.get("doc_name"),
+                "page_number": payload.get("page_number"),
+                "text": payload.get("text"),
                 "source_type": "user_doc"
             })
         return matches
@@ -203,7 +205,7 @@ class AdaVectorStore:
             models.FieldCondition(key="user_id", match=models.MatchValue(value=user_id)),
             models.FieldCondition(key="source_type", match=models.MatchValue(value="user_doc")),
         ])
-        old_point_ids = []
+        old_point_ids: List[models.ExtendedPointId] = []
         offset = None
         while True:
             page, offset = self.client.scroll(
@@ -238,7 +240,7 @@ class AdaVectorStore:
         if not user_id:
             return []
         try:
-            must_conds = [
+            must_conds: List[models.Condition] = [
                 models.FieldCondition(
                     key="doc_name",
                     match=models.MatchValue(value=doc_name)
@@ -258,17 +260,18 @@ class AdaVectorStore:
             )
             chunks = []
             for pt in scroll_res[0]:
+                payload = pt.payload or {}
                 chunks.append({
-                    "chunk_id": pt.payload.get("chunk_id"),
-                    "page_number": pt.payload.get("page_number", 1),
-                    "section_path": pt.payload.get("section_path"),
-                    "chunk_index": pt.payload.get("chunk_index"),
-                    "text": pt.payload.get("text", ""),
-                    "char_count": pt.payload.get("char_count", len(pt.payload.get("text", "")))
+                    "chunk_id": payload.get("chunk_id"),
+                    "page_number": payload.get("page_number", 1),
+                    "section_path": payload.get("section_path"),
+                    "chunk_index": payload.get("chunk_index"),
+                    "text": payload.get("text", ""),
+                    "char_count": payload.get("char_count", len(payload.get("text", "")))
                 })
             return sorted(chunks, key=lambda x: (x.get("page_number", 1), x.get("chunk_index") or 0))
-        except Exception as e:
-            print(f"[vector_store] Error fetching chunks for '{doc_name}': {e}")
+        except Exception:
+            logger.warning("Could not fetch indexed chunks for a vault document")
             return []
 
     def get_document_chunks_count(self, doc_name: str, user_id: Optional[str] = None) -> int:
@@ -276,7 +279,7 @@ class AdaVectorStore:
         if not user_id:
             return 0
         try:
-            must_conds = [
+            must_conds: List[models.Condition] = [
                 models.FieldCondition(
                     key="doc_name",
                     match=models.MatchValue(value=doc_name)
@@ -302,7 +305,7 @@ class AdaVectorStore:
         if not user_id:
             return False
         try:
-            must_conds = [
+            must_conds: List[models.Condition] = [
                 models.FieldCondition(
                     key="doc_name",
                     match=models.MatchValue(value=doc_name)
@@ -321,10 +324,10 @@ class AdaVectorStore:
                     filter=models.Filter(must=must_conds)
                 )
             )
-            print(f"[vector_store] Deleted document '{doc_name}' from Qdrant.")
+            logger.info("Deleted indexed chunks for a vault document")
             return True
-        except Exception as e:
-            print(f"[vector_store] Error deleting document '{doc_name}': {e}")
+        except Exception:
+            logger.warning("Could not delete indexed chunks for a vault document")
             return False
 
 # Thread-safe singleton accessor

@@ -2,19 +2,21 @@
 
 """
 
-import json
+import logging
 import re
 import uuid
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 from sqlalchemy.orm import Session
-from sqlalchemy import desc
 
 from engine.database import SessionLocal
 from engine.models import (
     Workspace, Run, Track, Source, Evidence,
-    Finding, Report, Claim, Score, Memory, LLMCall, Event
+    Finding, Report, Claim, Score, LLMCall, Event
 )
+from engine.storage.run_dossier import assemble_run_dossier
+
+logger = logging.getLogger(__name__)
 
 
 class RelationalStore:
@@ -176,7 +178,7 @@ class RelationalStore:
                 kind = ev.get("source_type", "web")
                 track_keys = ev.get("track_ids") or ([str(ev.get("track_id"))] if ev.get("track_id") else [])
                 db_track_id = next((track_ids[key] for key in track_keys if key in track_ids), None)
-                canonical_url = ev.get("url") or ev.get("doc_name") or f"src_{idx}"
+                canonical_url = ev.get("canonical_url") or ev.get("url") or ev.get("doc_name") or f"src_{idx}"
 
                 # Deduplicate sources per run
                 source = None
@@ -193,9 +195,10 @@ class RelationalStore:
                         kind=kind,
                         url=ev.get("url"),
                         canonical_url=canonical_url,
+                        content_hash=ev.get("content_hash"),
                         title=ev.get("title") or ev.get("doc_name") or "Source",
                         domain=ev.get("domain") or ("vault" if kind == "user_doc" else "web"),
-                        published_at=ev.get("date"),
+                        published_at=ev.get("published_date") or ev.get("date"),
                         authority_tier=ev.get("authority_score"),
                         tag=raw_tag,
                         track_id=db_track_id,
@@ -207,15 +210,17 @@ class RelationalStore:
                 source_tag_to_id[raw_tag] = source.id
 
                 # Create evidence record
-                quote_text = ev.get("text", "")[:4000]
+                quote_text = ev.get("quote") or ev.get("text", "")[:600]
                 evidence_record = Evidence(
                     id=str(uuid.uuid4()),
                     run_id=run_id,
                     source_id=source.id,
-                    claim=ev.get("title", ""),
+                    claim=ev.get("claim"),
                     track_id=db_track_id,
                     quote=quote_text,
-                    location=f"Page {ev.get('page_number')}" if ev.get("page_number") else ev.get("url"),
+                    location=ev.get("location") or (
+                        f"Page {ev.get('page_number')}" if ev.get("page_number") else ev.get("url")
+                    ),
                     values=ev.get("values", {}),
                     relevance=ev.get("relevance_score", 0.8),
                     final_score=ev.get("authority_score")
@@ -242,7 +247,7 @@ class RelationalStore:
                     description=f"Topic: {c.get('topic')}. Viewpoint A: {c.get('claim_a')} vs Viewpoint B: {c.get('claim_b')}",
                     evidence_ids=[c.get("source_a", ""), c.get("source_b", "")],
                     status="resolved" if c.get("resolution") else "open",
-                    resolution_note=c.get("analysis") or c.get("resolution"),
+                    resolution_note=c.get("resolution"),
                     followup=critic_audit.get("arbiter_queries", []),
                     round=1
                 )
@@ -256,7 +261,7 @@ class RelationalStore:
                     run_id=run_id,
                     type="gap",
                     description=g,
-                    status="resolved",
+                    status="open",
                     round=1
                 )
                 db.add(finding)
@@ -294,6 +299,11 @@ class RelationalStore:
             # explicitly unverified for inspection instead of dropping them.
             claim_items = list((guard_results or {}).get("claims", []))
             if not claim_items:
+                rejected_claims = {
+                    " ".join(str(claim).split())
+                    for claim in ((guard_results or {}).get("rejected_claims") or [])
+                    if isinstance(claim, str)
+                }
                 for line in markdown.splitlines():
                     stripped = line.strip()
                     if not stripped or stripped.startswith(("#", "|", "- [", "* [")):
@@ -301,11 +311,17 @@ class RelationalStore:
                     for sentence in re.split(r"(?<=[.!?])\s+", stripped):
                         tags = re.findall(r"\[((?:S|D)\d+)\]", sentence)
                         if tags:
+                            normalized_sentence = " ".join(sentence.split())
+                            is_rejected = normalized_sentence in rejected_claims
                             claim_items.append({
                                 "sentence": sentence.strip(),
                                 "tags": list(dict.fromkeys(tags)),
-                                "verdict": "unverified",
-                                "reason": "This report was saved without a claim-entailment audit.",
+                                "verdict": "flagged" if is_rejected else "unverified",
+                                "reason": (
+                                    "The citation guard rejected this claim."
+                                    if is_rejected
+                                    else "This report was saved without a claim-entailment audit."
+                                ),
                             })
 
             for item in claim_items:
@@ -355,6 +371,22 @@ class RelationalStore:
             db.close()
 
     @classmethod
+    def update_research_budget(cls, run_id: str, budget_usage: Dict[str, Any]) -> bool:
+        """Persist final run-budget counters without replacing score details."""
+        db = cls.get_session()
+        try:
+            score = db.query(Score).filter(Score.run_id == run_id).first()
+            if not score:
+                return False
+            details = dict(score.details or {})
+            details["research_budget"] = budget_usage
+            score.details = details
+            db.commit()
+            return True
+        finally:
+            db.close()
+
+    @classmethod
     def record_llm_call(
         cls,
         run_id: Optional[str],
@@ -387,6 +419,7 @@ class RelationalStore:
             db.refresh(call)
             return call
         except Exception:
+            logger.exception("Could not persist LLM-call usage for run %s", run_id)
             return None
         finally:
             db.close()
@@ -446,7 +479,7 @@ class RelationalStore:
         """Appends an event to the durable sequence for SSE stream replay."""
         db = cls.get_session()
         try:
-            last_event = db.query(Event).filter(Event.run_id == run_id).order_by(desc(Event.seq)).first()
+            last_event = db.query(Event).filter(Event.run_id == run_id).order_by(Event.seq.desc()).first()
             seq = (last_event.seq + 1) if last_event else 1
 
             event = Event(
@@ -461,6 +494,7 @@ class RelationalStore:
             db.refresh(event)
             return event
         except Exception:
+            logger.exception("Could not persist event %s for run %s", event_type, run_id)
             return None
         finally:
             db.close()
@@ -521,7 +555,7 @@ class RelationalStore:
         """Returns the latest report for a given run."""
         db = cls.get_session()
         try:
-            report = db.query(Report).filter(Report.run_id == run_id).order_by(desc(Report.created_at)).first()
+            report = db.query(Report).filter(Report.run_id == run_id).order_by(Report.created_at.desc()).first()
             if not report:
                 return None
             return {
@@ -545,7 +579,7 @@ class RelationalStore:
             if not run:
                 return None
 
-            report = db.query(Report).filter(Report.run_id == run_id).order_by(desc(Report.created_at)).first()
+            report = db.query(Report).filter(Report.run_id == run_id).order_by(Report.created_at.desc()).first()
             score = db.query(Score).filter(Score.run_id == run_id).first()
 
             sources = db.query(Source).filter(Source.run_id == run_id).all()
@@ -555,111 +589,17 @@ class RelationalStore:
             events = db.query(Event).filter(Event.run_id == run_id).order_by(Event.seq.asc()).all()
             claims = db.query(Claim).filter(Claim.report_id == report.id).all() if report else []
 
-            sources_list = [
-                {
-                    "source_id": s.tag,
-                    "kind": s.kind,
-                    "title": s.title,
-                    "url": s.url,
-                    "domain": s.domain,
-                    "authority_tier": s.authority_tier,
-                    "published_at": s.published_at
-                }
-                for s in sources
-            ]
-
-            findings_list = [
-                {
-                    "id": f.id,
-                    "type": f.type,
-                    "description": f.description,
-                    "status": f.status,
-                    "resolution_note": f.resolution_note
-                }
-                for f in findings
-            ]
-
-            claims_list = [
-                {
-                    "sentence": c.sentence,
-                    "tags": c.tags,
-                    "verdict": c.verdict,
-                    "reason": c.reason
-                }
-                for c in claims
-            ]
-
-            tracks_list = [
-                {
-                    "id": t.id,
-                    "title": t.title,
-                    "status": "running" if t.status in ("pending", "researching") and run.status not in ("completed", "failed", "cancelled") else ("completed" if t.status == "completed" or run.status == "completed" else t.status),
-                    "sources_count": (t.stats or {}).get("sources_found", 0),
-                    "queries_count": len(t.subquestions or []),
-                    "progress_pct": 100 if t.status == "completed" or run.status == "completed" else 50 if t.status == "researching" else 0,
-                }
-                for t in tracks
-            ]
-            llm_calls_list = [
-                {
-                    "id": call.id,
-                    "agent": call.agent,
-                    "model": call.model,
-                    "tokens_in": call.tokens_in,
-                    "tokens_out": call.tokens_out,
-                    "latency_ms": call.latency_ms,
-                    "cost": call.cost,
-                    "cache_hit": call.cache_hit,
-                    "trace_id": call.trace_id,
-                    "created_at": call.created_at.isoformat() if call.created_at else None,
-                }
-                for call in llm_calls
-            ]
-            events_list = [
-                {
-                    "id": event.id,
-                    "seq": event.seq,
-                    "type": event.type,
-                    "payload": event.payload,
-                    "created_at": event.created_at.isoformat() if event.created_at else None,
-                }
-                for event in events
-            ]
-            provider_warnings = [event["payload"] for event in events_list if event["type"] == "provider_degraded"]
-            research_warnings = [event["payload"] for event in events_list if event["type"] == "research_warning"]
-            settings = run.settings or {}
-
-            return {
-                "run_id": run.id,
-                "question": run.question,
-                "query": run.question,
-                "depth": settings.get("depth", "standard"),
-                "status": run.status,
-                "stage": run.stage,
-                "progress": run.progress,
-                "created_at": run.created_at.isoformat() if run.created_at else None,
-                "completed_at": run.completed_at.isoformat() if run.completed_at else None,
-                "report_markdown": report.markdown if report else None,
-                "report_id": report.id if report else None,
-                "scores": {
-                    "faithfulness": score.faithfulness,
-                    "relevancy": score.relevancy,
-                    "authority": score.authority,
-                    "coverage": score.coverage,
-                    "citation_validity": (score.details or {}).get("citation_validity"),
-                } if score else None,
-                "citation_validity_score": (score.details or {}).get("citation_validity") if score else None,
-                "sources_count": len(sources),
-                "sources": sources_list,
-                "findings": findings_list,
-                "claims": claims_list,
-                "tracks_count": len(tracks),
-                "tracks": tracks_list,
-                "llm_calls": llm_calls_list,
-                "events": events_list,
-                "provider_warnings": provider_warnings,
-                "research_warnings": research_warnings,
-            }
+            return assemble_run_dossier(
+                run=run,
+                report=report,
+                score=score,
+                sources=sources,
+                findings=findings,
+                tracks=tracks,
+                llm_calls=llm_calls,
+                events=events,
+                claims=claims,
+            )
         finally:
             db.close()
 
@@ -668,7 +608,7 @@ class RelationalStore:
         """Updates the current report version after an authenticated addendum."""
         db = cls.get_session()
         try:
-            report = db.query(Report).filter(Report.run_id == run_id).order_by(desc(Report.created_at)).first()
+            report = db.query(Report).filter(Report.run_id == run_id).order_by(Report.created_at.desc()).first()
             if not report:
                 return False
             report.markdown = markdown

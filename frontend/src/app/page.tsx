@@ -7,7 +7,8 @@ import {
   AlertCircle, ArrowRight, Database, SlidersHorizontal
 } from "lucide-react";
 import Navbar from "@/components/Navbar";
-import ClarificationModal, { ScopingBlueprint } from "@/components/ClarificationModal";
+import ClarificationModal from "@/components/ClarificationModal";
+import type { ResearchBlueprint } from "@/lib/api-types";
 import { useAuth } from "@/context/AuthContext";
 import { API_URL } from "@/lib/config";
 
@@ -30,7 +31,9 @@ export default function PublicLandingAndDeskPage() {
   // Screen 7.1 Input & Settings State
   const [query, setQuery] = useState("");
   const [depth, setDepth] = useState<"quick" | "standard" | "deep">("standard");
-  const [useDocuments, setUseDocuments] = useState(true);
+  // Private vault sources are opt-in so a new research request never includes
+  // personal documents unless the user explicitly enables them.
+  const [useDocuments, setUseDocuments] = useState(false);
   const [documentCount, setDocumentCount] = useState(0);
   const [domainScope, setDomainScope] = useState<"all" | "academic" | "financial">("all");
   const [moreOptionsOpen, setMoreOptionsOpen] = useState(false);
@@ -38,7 +41,7 @@ export default function PublicLandingAndDeskPage() {
 
   // Scoping Clarification Modal State (Screen 7.2)
   const [scopingModalOpen, setScopingModalOpen] = useState(false);
-  const [blueprint, setBlueprint] = useState<ScopingBlueprint | null>(null);
+  const [blueprint, setBlueprint] = useState<ResearchBlueprint | null>(null);
   const [scopingLoading, setScopingLoading] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState("");
@@ -128,7 +131,7 @@ export default function PublicLandingAndDeskPage() {
         });
 
         if (res.ok) {
-          const bp: ScopingBlueprint = await res.json();
+          const bp: ResearchBlueprint = await res.json();
           setBlueprint(bp);
           if (
             bp.ambiguity_detected ||
@@ -316,8 +319,9 @@ export default function PublicLandingAndDeskPage() {
               <button
                 type="button"
                 onClick={() => setUseDocuments(!useDocuments)}
+                aria-pressed={useDocuments}
                 className={`chip ${useDocuments ? "chip-active" : ""}`}
-                title="Cross-reference private vault documents"
+                title={`${useDocuments ? "Exclude" : "Include"} all ${documentCount} private vault documents`}
               >
                 <Database className="w-3.5 h-3.5" />
                 <span>Vault ({documentCount})</span>
@@ -616,7 +620,7 @@ export default function PublicLandingAndDeskPage() {
             <span>·</span>
             <span>Personal research workspace</span>
           </div>
-          <div className="flex items-center gap-6 font-mono text-[11px]">
+          <div className="flex flex-wrap items-center justify-center gap-x-4 gap-y-2 font-mono text-[11px]">
             {!user && <a href="#features" className="hover:text-[var(--ink)] transition-colors">Features</a>}
             {!user && <a href="#how-it-works" className="hover:text-[var(--ink)] transition-colors">How It Works</a>}
             <Link href="/architecture" className="hover:text-[var(--ink)] transition-colors">Architecture</Link>
@@ -629,6 +633,7 @@ export default function PublicLandingAndDeskPage() {
 
       {/* Screen 7.2: Scoping / Clarification Dialog */}
       <ClarificationModal
+        key={blueprint ? JSON.stringify(blueprint) : "empty-blueprint"}
         isOpen={scopingModalOpen}
         query={query}
         blueprint={blueprint}

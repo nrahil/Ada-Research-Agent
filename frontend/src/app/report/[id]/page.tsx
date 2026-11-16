@@ -1,41 +1,28 @@
 "use client";
 
-import React, { useState, useEffect, useRef, use, useMemo } from "react";
+import React, { useState, useEffect, useRef, use, useMemo, useCallback } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import {
-  ArrowLeft, Check, Copy, ExternalLink, Printer,
-  ShieldCheck, AlertTriangle, X, ChevronRight, Share2,
-  Database, Activity, FileText, CornerDownRight, MessageSquare,
-  CheckCircle2, ChevronDown, Plus, Download, Sliders
+  ArrowLeft, Check, Copy, Printer,
+  ShieldCheck, AlertTriangle, Share2,
+  CheckCircle2
 } from "lucide-react";
 import Navbar from "@/components/Navbar";
 import RunInspectorDrawer from "@/components/RunInspectorDrawer";
+import ReportEvidencePanel from "@/components/report/ReportEvidencePanel";
+import ReportMonograph from "@/components/report/ReportMonograph";
+import CitationInspectorDrawer from "@/components/report/CitationInspectorDrawer";
 import { API_URL, formatDossierDate } from "@/lib/config";
 import { useAuth } from "@/context/AuthContext";
-
-function headingText(node: any): string {
-  if (node == null || typeof node === "boolean") return "";
-  if (typeof node === "string" || typeof node === "number") return String(node);
-  if (Array.isArray(node)) return node.map(headingText).join("");
-  if (React.isValidElement(node)) return headingText((node.props as any).children);
-  return "";
-}
-
-function headingSlug(value: string): string {
-  return value.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "section";
-}
-
-function sourceDomain(url?: string | null): string {
-  if (!url) return "vault";
-  try {
-    return new URL(url).hostname;
-  } catch {
-    return "external source";
-  }
-}
+import { useReportFollowups } from "@/hooks/useReportFollowups";
+import {
+  buildCitationMap,
+  buildReportChapters,
+  buildReportSources,
+  getReportWarnings,
+} from "@/lib/report-content";
+import type { CitationDetails, ReportData } from "@/lib/report-types";
 
 export default function ReportReaderPage({
   params,
@@ -48,7 +35,7 @@ export default function ReportReaderPage({
   const { token, loading: authLoading } = useAuth();
 
   // Core Data
-  const [report, setReport] = useState<any>(null);
+  const [report, setReport] = useState<ReportData | null>(null);
   const [loading, setLoading] = useState(true);
   const [status, setStatus] = useState<string>("loading");
   const [copied, setCopied] = useState(false);
@@ -62,23 +49,37 @@ export default function ReportReaderPage({
   const [activeSectionId, setActiveSectionId] = useState<string>("");
 
   // Screen 7.8 Evidence Inspector & Claim Overlay
-  const [selectedCitation, setSelectedCitation] = useState<any>(null);
+  const [selectedCitation, setSelectedCitation] = useState<CitationDetails | null>(null);
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [runInspectorOpen, setRunInspectorOpen] = useState(false);
 
-  // Screen 7.5 Follow-up Panel
-  const [followupQuery, setFollowupQuery] = useState("");
-  const [followupLoading, setFollowupLoading] = useState(false);
-  const [followupThreads, setFollowupThreads] = useState<any[]>([]);
-  const [selectedFollowupText, setSelectedFollowupText] = useState("");
   const followupInputRef = useRef<HTMLInputElement>(null);
 
   // Selection Floating Menu
   const [floatingSelection, setFloatingSelection] = useState<{ text: string; x: number; y: number } | null>(null);
 
-  const showToast = (msg: string) => {
+  const showToast = useCallback((msg: string) => {
     setToastMsg(msg);
     setTimeout(() => setToastMsg(null), 3000);
+  }, []);
+
+  const {
+    query: followupQuery,
+    setQuery: setFollowupQuery,
+    loading: followupLoading,
+    threads: followupThreads,
+    selectedText: selectedFollowupText,
+    setSelectedText: setSelectedFollowupText,
+    submit: submitFollowup,
+  } = useReportFollowups(reportId, token, showToast);
+
+  const navigateToSection = (event: React.MouseEvent<HTMLAnchorElement>, sectionId: string) => {
+    const target = document.getElementById(sectionId);
+    if (!target) return;
+    event.preventDefault();
+    window.history.replaceState(null, "", `#${encodeURIComponent(sectionId)}`);
+    target.scrollIntoView({ behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "instant" : "smooth", block: "start" });
+    setActiveSectionId(sectionId);
   };
 
   // Reading progress tracking & Scroll-spy
@@ -109,13 +110,17 @@ export default function ReportReaderPage({
   // Fetch report data
   useEffect(() => {
     if (authLoading) return;
+    const controller = new AbortController();
     const headers: Record<string, string> = {};
     if (token) headers["Authorization"] = `Bearer ${token}`;
 
-    fetch(`${API_URL}/api/v1/runs/${reportId}/report`, { headers })
+    fetch(`${API_URL}/api/v1/runs/${reportId}/report`, { headers, signal: controller.signal })
       .then(async (res) => {
         if (res.ok) return res.json();
-        const fallback = await fetch(`${API_URL}/api/report/status/${reportId}`, { headers });
+        const fallback = await fetch(`${API_URL}/api/report/status/${reportId}`, {
+          headers,
+          signal: controller.signal,
+        });
         if (!fallback.ok) throw new Error("Research dossier not found or access denied.");
         const data = await fallback.json();
         if (data.status !== "completed") {
@@ -135,14 +140,19 @@ export default function ReportReaderPage({
           setStatus("not_found");
           return;
         }
-        setReport(data);
+        setReport(data as ReportData);
         setStatus("completed");
       })
       .catch((err) => {
+        if (controller.signal.aborted) return;
         console.warn("Report fetch warning:", err);
         setStatus("not_found");
       })
-      .finally(() => setLoading(false));
+      .finally(() => {
+        if (!controller.signal.aborted) setLoading(false);
+      });
+
+    return () => controller.abort();
   }, [authLoading, reportId, token, router]);
 
   // Handle text selection for "Ask about this" floating action
@@ -169,76 +179,37 @@ export default function ReportReaderPage({
     return () => document.removeEventListener("mouseup", handleMouseUp);
   }, []);
 
-  // Citation Index Mapping
-  const citationMap = useMemo(() => {
-    const map = new Map<string, any>();
-    if (!report) return map;
-
-    // Check evidence manifest
-    if (report.evidence_manifest) {
-      report.evidence_manifest.forEach((ev: any) => {
-        const id = ev.source_id || ev.id;
-        map.set(id, {
-          id,
-          title: ev.title || ev.doc_name || "Primary source",
-          url: ev.url,
-          domain: ev.domain || sourceDomain(ev.url),
-          doc_name: ev.doc_name,
-          snippet: ev.text || ev.quote || ev.snippet,
-          authority: ev.authority_score != null ? ev.authority_score * 5 : null,
-          kind: ev.doc_name ? "doc" : "web",
-          verdict: "reference_found",
-          reason: "Citation ID resolves to a retrieved passage; claim entailment was not evaluated",
-        });
-      });
-    }
-
-    // Check sources list from relational store
-    if (report.sources) {
-      report.sources.forEach((s: any) => {
-        const id = s.source_id || s.id;
-        if (!map.has(id)) {
-          map.set(id, {
-            id,
-            title: s.title || s.domain,
-            url: s.url,
-            domain: s.domain,
-            authority: s.authority_tier != null ? s.authority_tier * 5 : null,
-            kind: s.kind === "user_doc" || s.kind === "doc" ? "doc" : "web",
-            snippet: s.snippet || "",
-            verdict: "reference_found",
-          });
-        }
-      });
-    }
-
-    return map;
-  }, [report]);
-
-  // Chapters for Left Table of Contents
-  const chapters = useMemo(() => {
-    const md = report?.monograph || report?.report_markdown || "";
-    if (!md) return [];
-    const lines = md.split("\n");
-    const result: { id: string; title: string }[] = [];
-
-    const seen: Record<string, number> = {};
-    lines.forEach((line: string) => {
-      if (line.startsWith("## ")) {
-        const title = line.replace(/^##\s+/, "").replace(/[`*_~]/g, "").replace(/\[([^\]]+)\]\([^)]+\)/g, "$1").trim();
-        const base = headingSlug(title);
-        const occurrence = seen[base] || 0;
-        seen[base] = occurrence + 1;
-        const id = occurrence ? `${base}-${occurrence + 1}` : base;
-        result.push({ id, title });
-      }
+  // Report transformations stay pure so section navigation and citation lookup
+  // use the same rules in the UI.
+  const citationMap = useMemo(() => buildCitationMap(report), [report]);
+  const reportSources = useMemo(() => buildReportSources(report), [report]);
+  const chapters = useMemo(
+    () => buildReportChapters(report?.monograph || report?.report_markdown || ""),
+    [report],
+  );
+  // ReactMarkdown's heading renderer may be invoked more than once in development.
+  // Reconcile rendered IDs to the same deterministic list used by the contents links.
+  useEffect(() => {
+    if (!report) return;
+    const headings = Array.from(document.querySelectorAll<HTMLElement>(".monograph-prose h2"));
+    headings.forEach((heading, index) => {
+      const chapter = chapters[index];
+      if (chapter) heading.id = chapter.id;
     });
 
-    if (result.length === 0) {
-      result.push({ id: "overview", title: "Executive Intelligence Briefing" });
-    }
-    return result;
-  }, [report]);
+    if (!window.location.hash) return;
+    const sectionId = decodeURIComponent(window.location.hash.slice(1));
+    const frame = window.requestAnimationFrame(() => {
+      const target = document.getElementById(sectionId);
+      if (!target) return;
+      target.scrollIntoView({ block: "start" });
+      setActiveSectionId(sectionId);
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [report, chapters]);
+  const sourcesChapter = chapters.find(({ title }) =>
+    /^(?:evidence\s+sources|primary\s+sources|sources?\s*(?:&|and)\s*citations?|bibliography)\b/i.test(title)
+  );
 
   const handleCitationClick = (citationTag: string) => {
     const cleanTag = citationTag.replace(/[\[\]]/g, "");
@@ -249,6 +220,7 @@ export default function ReportReaderPage({
       authority: null,
       snippet: "",
       verdict: "unresolved",
+      kind: "web" as const,
     };
     setSelectedCitation(src);
     setInspectorOpen(true);
@@ -274,7 +246,7 @@ export default function ReportReaderPage({
         });
         const data = await response.json().catch(() => ({}));
         if (!response.ok) throw new Error(data.detail || "Could not enable public sharing.");
-        setReport((current: any) => current ? { ...current, is_public: data.is_public } : current);
+        setReport((current) => current ? { ...current, is_public: Boolean(data.is_public) } : current);
       }
       await navigator.clipboard.writeText(window.location.href);
       showToast(report?.is_public ? "Public dossier link copied." : "Public sharing enabled. Link copied.");
@@ -285,52 +257,9 @@ export default function ReportReaderPage({
     }
   };
 
-  // Follow-up Inquiry Submission (Screen 7.5)
   const handleFollowupSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!followupQuery.trim() || followupLoading) return;
-
-    const q = followupQuery.trim();
-    setFollowupLoading(true);
-
-    try {
-      const res = await fetch(`${API_URL}/api/report/${reportId}/query-evidence`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        },
-        body: JSON.stringify({ question: q, selected_text: selectedFollowupText }),
-      });
-
-      if (!res.ok) {
-        const details = await res.json().catch(() => ({}));
-        throw new Error(details.detail || "Unable to answer from this report's evidence.");
-      }
-
-      const data = await res.json();
-      setFollowupThreads((prev) => [
-        ...prev,
-        {
-          id: Date.now(),
-          question: q,
-          answer: data.answer,
-          path: data.verification_status === "verified"
-            ? "Checked against report evidence"
-            : data.status === "insufficient_evidence"
-              ? "No supporting report evidence"
-              : "Citations checked · entailment uncertain",
-          citations: data.citations || [],
-          verificationStatus: data.verification_status,
-        },
-      ]);
-      setFollowupQuery("");
-      setSelectedFollowupText("");
-    } catch (err) {
-      showToast(err instanceof Error ? err.message : "Follow-up investigation failed.");
-    } finally {
-      setFollowupLoading(false);
-    }
+    await submitFollowup();
   };
 
   if (loading) {
@@ -365,7 +294,6 @@ export default function ReportReaderPage({
   const depth = report.depth || "standard";
   const dateStr = formatDossierDate(report.created_at);
   const sourcesCount = report.sources?.length || report.evidence_manifest?.length || 0;
-  const renderedHeadingCounts = new Map<string, number>();
 
   // Scores - authentically loaded from report telemetry or null if not yet evaluated
   const scores = report.scores || (report.faithfulness_score !== undefined || report.coverage_score !== undefined ? {
@@ -375,24 +303,7 @@ export default function ReportReaderPage({
     coverage: report.coverage_score != null ? report.coverage_score / 100 : null,
   } : null);
   const citationValidity = report.citation_validity_score ?? report.guard_results?.citation_validity_score ?? null;
-  const runWarnings = [
-    ...(Array.isArray(report.research_warnings) ? report.research_warnings : []),
-    ...(Array.isArray(report.provider_warnings) ? report.provider_warnings : []),
-  ].map((warning: unknown) => {
-    if (typeof warning === "string") return warning;
-    if (warning && typeof warning === "object") {
-      const item = warning as Record<string, unknown>;
-      return String(item.message || item.detail || "A research service was unavailable.");
-    }
-    return "A research service was unavailable.";
-  });
-
-  // Text size class mapping
-  const textSizeClasses = {
-    S: "text-[15px] leading-[1.65]",
-    M: "text-[18px] leading-[1.68]",
-    L: "text-[20px] leading-[1.72]",
-  };
+  const runWarnings = getReportWarnings(report);
 
   return (
     <div className="min-h-screen bg-[var(--paper)] text-[var(--ink)] flex flex-col font-sans selection:bg-[var(--accent-soft)]">
@@ -536,7 +447,10 @@ export default function ReportReaderPage({
                 <a
                   key={ch.id}
                   href={`#${ch.id}`}
-                  className={`block py-1 pl-2.5 transition-all truncate text-xs ${
+                  onClick={(event) => navigateToSection(event, ch.id)}
+                  aria-current={isActive ? "location" : undefined}
+                  title={`Go to ${ch.title}`}
+                  className={`block cursor-pointer py-1 pl-2.5 transition-all truncate text-xs hover:underline underline-offset-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] ${
                     isActive
                       ? "border-l-2 border-[var(--accent)] font-semibold text-[var(--ink)]"
                       : "border-l-2 border-transparent text-[var(--ink-3)] hover:text-[var(--ink-2)]"
@@ -548,14 +462,17 @@ export default function ReportReaderPage({
             })}
           </div>
 
-          <div className="pt-4 border-t border-[var(--line)] space-y-2">
-            <a
-              href="#sources"
-              className="text-xs font-mono text-[var(--ink-3)] hover:text-[var(--accent)] block"
-            >
-              Primary Sources ({sourcesCount}) →
-            </a>
-          </div>
+          {sourcesChapter && (
+            <div className="pt-4 border-t border-[var(--line)] space-y-2">
+              <a
+                href={`#${sourcesChapter.id}`}
+                onClick={(event) => navigateToSection(event, sourcesChapter.id)}
+                className="block cursor-pointer text-xs font-mono text-[var(--ink-3)] hover:text-[var(--accent)] hover:underline underline-offset-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
+              >
+                Primary Sources ({sourcesCount}) →
+              </a>
+            </div>
+          )}
         </nav>
 
         {/* ── Column 2: CENTER READING COLUMN (Max 68ch) ─────────────── */}
@@ -586,95 +503,11 @@ export default function ReportReaderPage({
             </aside>
           )}
 
-          {/* Monograph Body rendered with Markdown & Citations */}
-          <div className={`font-serif ${textSizeClasses[textSize]} text-[var(--ink)] leading-[1.68] space-y-6 monograph-prose`}>
-            <ReactMarkdown
-              remarkPlugins={[remarkGfm]}
-              components={{
-                h2: ({ children }) => {
-                  const titleText = headingText(children);
-                  const base = headingSlug(titleText);
-                  const occurrence = renderedHeadingCounts.get(base) || 0;
-                  renderedHeadingCounts.set(base, occurrence + 1);
-                  const id = occurrence ? `${base}-${occurrence + 1}` : base;
-                  return (
-                    <h2
-                      id={id}
-                      className="font-serif text-[24px] font-semibold text-[var(--ink)] pt-10 pb-2 mt-8 border-t border-[var(--line)] scroll-mt-16 leading-snug"
-                    >
-                      {children}
-                    </h2>
-                  );
-                },
-                h3: ({ children }) => (
-                  <h3 className="font-serif text-[19px] font-semibold text-[var(--ink)] pt-6 pb-1 leading-snug">
-                    {children}
-                  </h3>
-                ),
-                p: ({ children }) => {
-                  return (
-                    <p className="my-4 leading-[1.68]">
-                      {React.Children.map(children, (child) => {
-                        if (typeof child === "string") {
-                          // Match inline citation tags like [S1], [D2]
-                          const parts = child.split(/(\[(?:S|D)?\d+\])/g);
-                          return parts.map((part, pIdx) => {
-                            const match = part.match(/^\[((?:S|D)?\d+)\]$/);
-                            if (match) {
-                              const tag = match[1];
-                              return (
-                                <button
-                                  key={pIdx}
-                                  type="button"
-                                  onClick={() => handleCitationClick(tag)}
-                                  className="citation-badge"
-                                  title={`View citation [${tag}]`}
-                                >
-                                  [{tag}]
-                                </button>
-                              );
-                            }
-
-                            return part;
-                          });
-                        }
-                        return child;
-                      })}
-                    </p>
-                  );
-                },
-                blockquote: ({ children }) => (
-                  <blockquote className="border-l-2 border-[var(--accent)] pl-4 py-1 my-6 font-serif italic text-[var(--ink-2)] bg-transparent">
-                    {children}
-                  </blockquote>
-                ),
-                table: ({ children }) => (
-                  <div className="my-8 overflow-x-auto border border-[var(--line)] rounded-[6px] bg-[var(--surface)]">
-                    <table className="w-full text-left font-sans text-xs">
-                      {children}
-                    </table>
-                  </div>
-                ),
-                thead: ({ children }) => (
-                  <thead className="bg-[var(--surface-2)] font-mono text-[11px] uppercase text-[var(--ink-3)] border-b border-[var(--line)]">
-                    {children}
-                  </thead>
-                ),
-                th: ({ children }) => (
-                  <th className="py-2.5 px-3.5 font-semibold text-[var(--ink-2)]">
-                    {children}
-                  </th>
-                ),
-                td: ({ children }) => (
-                  <td className="py-2.5 px-3.5 border-t border-[var(--line)] font-mono text-[12px] text-[var(--ink)]">
-                    {children}
-                  </td>
-                ),
-              }}
-            >
-              {markdownContent}
-            </ReactMarkdown>
-          </div>
+          <ReportMonograph
+            markdown={markdownContent}
+            textSize={textSize}
+            onCitationClick={handleCitationClick}
+          />
 
           {/* ─── Screen 7.5 Docked Follow-Up Panel ─────────────────────── */}
           <section className="pt-12 border-t border-[var(--line)] space-y-4 no-print">
@@ -737,197 +570,18 @@ export default function ReportReaderPage({
           </section>
         </article>
 
-        {/* ── Column 3: SCORES PANEL (Right, 280px, collapses < 1200px) ─ */}
-        <aside className="hidden xl:block w-[280px] shrink-0 sticky top-20 space-y-6 font-sans">
-          {/* Quality Scores Card */}
-          <div className="p-4 rounded-[10px] bg-[var(--surface)] border border-[var(--line)] space-y-4">
-            <span className="text-[11px] font-mono uppercase tracking-wider text-[var(--ink-3)] font-semibold block">
-              Evidence Signals
-            </span>
-
-            {scores ? (
-              <>
-                <div className="space-y-3 font-mono text-xs">
-                  {/* Claim entailment */}
-                  <div className="space-y-1">
-                    <div className="flex justify-between text-[11px]">
-                      <span className="text-[var(--ink-2)]">Claims supported</span>
-                      <span className="font-semibold text-[var(--ok)]">
-                        {scores.faithfulness != null ? `${(scores.faithfulness * 100).toFixed(0)}%` : "—"}
-                      </span>
-                    </div>
-                    <div className="w-full h-1 bg-[var(--line)] rounded-full overflow-hidden">
-                      <div
-                        className="h-full bg-[var(--ok)] rounded-full"
-                        style={{ width: `${scores.faithfulness != null ? scores.faithfulness * 100 : 0}%` }}
-                      />
-                    </div>
-                  </div>
-
-                  {/* Relevancy */}
-                  <div className="space-y-1">
-                    <div className="flex justify-between text-[11px]">
-                      <span className="text-[var(--ink-2)]">Relevancy</span>
-                      <span className="font-semibold text-[var(--ink)]">
-                        {scores.relevancy != null ? `${(scores.relevancy * 100).toFixed(0)}%` : "—"}
-                      </span>
-                    </div>
-                    <div className="w-full h-1 bg-[var(--line)] rounded-full overflow-hidden">
-                      <div
-                        className="h-full bg-[var(--accent)] rounded-full"
-                        style={{ width: `${scores.relevancy != null ? scores.relevancy * 100 : 0}%` }}
-                      />
-                    </div>
-                  </div>
-
-                  {/* Authority */}
-                  <div className="space-y-1">
-                    <div className="flex justify-between text-[11px]">
-                      <span className="text-[var(--ink-2)]">Source authority estimate</span>
-                      <span className="font-semibold text-[var(--ink)]">
-                        {scores.authority != null ? `${(scores.authority * 100).toFixed(0)}%` : "—"}
-                      </span>
-                    </div>
-                    <div className="w-full h-1 bg-[var(--line)] rounded-full overflow-hidden">
-                      <div
-                        className="h-full bg-[var(--ink-2)] rounded-full"
-                        style={{ width: `${scores.authority != null ? scores.authority * 100 : 0}%` }}
-                      />
-                    </div>
-                  </div>
-
-                  {/* Coverage */}
-                  <div className="space-y-1">
-                    <div className="flex justify-between text-[11px]">
-                      <span className="text-[var(--ink-2)]">Coverage</span>
-                      <span className="font-semibold text-[var(--ink)]">
-                        {scores.coverage != null ? `${(scores.coverage * 100).toFixed(0)}%` : "—"}
-                      </span>
-                    </div>
-                    <div className="w-full h-1 bg-[var(--line)] rounded-full overflow-hidden">
-                      <div
-                        className="h-full bg-[var(--accent)] rounded-full"
-                        style={{ width: `${scores.coverage != null ? scores.coverage * 100 : 0}%` }}
-                      />
-                    </div>
-                  </div>
-                </div>
-
-                <div className="flex justify-between text-[11px] font-mono pt-2 border-t border-[var(--line)]">
-                  <span className="text-[var(--ink-2)]">Citation IDs resolved</span>
-                  <span className="font-semibold text-[var(--ink)]">{citationValidity != null ? `${(citationValidity * 100).toFixed(0)}%` : "Not measured"}</span>
-                </div>
-
-                <p className="text-xs font-sans text-[var(--ink-2)] pt-1 border-t border-[var(--line)] leading-relaxed">
-                  Claim support is judged against cited excerpts. Unavailable judgments are shown as unmeasured; citation-ID validity is reported separately.
-                </p>
-              </>
-            ) : (
-              <div className="space-y-2 py-1">
-                <p className="text-xs font-sans text-[var(--ink-3)] leading-relaxed">
-                  Verification telemetry was not recorded for this legacy dossier.
-                </p>
-              </div>
-            )}
-
-            <button
-              type="button"
-              onClick={() => setRunInspectorOpen(true)}
-              className="btn-secondary w-full text-xs"
-            >
-              <span>Open details</span>
-              <ChevronRight className="w-3.5 h-3.5" />
-            </button>
-          </div>
-
-          {/* Pruned Claims Section */}
-          <div className="p-3.5 rounded-[8px] bg-[var(--surface-2)]/30 border border-[var(--line)] space-y-2 text-xs">
-            <span className="text-[10px] font-mono uppercase text-[var(--ink-3)] font-semibold block">
-              Unmatched Citation IDs
-            </span>
-            <p className="text-[11px] text-[var(--ink-3)] leading-relaxed">
-              {report.guard_results?.hallucinated_sources_count ?? "—"} citation IDs did not match the retrieved evidence manifest. Claim judgments and reasons are listed in run details.
-            </p>
-          </div>
-        </aside>
+        <ReportEvidencePanel
+          scores={scores}
+          citationValidity={citationValidity}
+          unmatchedCitationCount={report.guard_results?.hallucinated_sources_count}
+          onOpenDetails={() => setRunInspectorOpen(true)}
+        />
       </div>
 
-      {/* ─── Screen 7.8 Evidence Inspector Drawer (Right, 380px) ───────── */}
-      {inspectorOpen && selectedCitation && (
-        <div className="fixed inset-0 z-50 flex items-center justify-end bg-black/40">
-          <div className="w-full max-w-[380px] h-full bg-[var(--surface)] border-l border-[var(--line)] p-6 flex flex-col justify-between shadow-2xl animate-in slide-in-from-right duration-200">
-            <div className="space-y-4">
-              <div className="flex items-center justify-between pb-3 border-b border-[var(--line)]">
-                <div className="flex items-center gap-2">
-                  <span className="text-[10px] font-mono uppercase font-bold px-1.5 py-0.5 rounded bg-[var(--surface-2)] text-[var(--accent)]">
-                    {selectedCitation.kind === "doc" ? "VAULT" : "RESEARCH"}
-                  </span>
-                  <span className="text-xs font-mono font-semibold text-[var(--ink)]">
-                    Citation [{selectedCitation.id}]
-                  </span>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => setInspectorOpen(false)}
-                  className="p-1 text-[var(--ink-3)] hover:text-[var(--ink)]"
-                >
-                  <X className="w-4 h-4" />
-                </button>
-              </div>
-
-              <h3 className="font-serif text-[16px] text-[var(--ink)] leading-snug">
-                {selectedCitation.title}
-              </h3>
-
-              <div className="text-xs font-mono text-[var(--ink-3)] space-y-1">
-                <div>Domain: {selectedCitation.domain}</div>
-                <div>Authority estimate: {selectedCitation.authority != null ? `${selectedCitation.authority.toFixed(1)} / 5` : selectedCitation.kind === "doc" ? "User-provided; not scored" : "Not scored"}</div>
-              </div>
-
-              {/* Status Verdict */}
-              <div className="p-2.5 rounded-[4px] bg-[var(--ok-soft)] border border-[var(--ok)]/40 text-xs flex items-center gap-2">
-                <Check className="w-3.5 h-3.5 text-[var(--ok)] shrink-0" />
-                <span className="text-[var(--ok)] font-medium">
-                  {selectedCitation.verdict === "unresolved" ? "Citation reference not found" : "Citation reference located"}
-                </span>
-              </div>
-
-              {/* Verbatim Excerpt */}
-              {selectedCitation.snippet && (
-                <div className="space-y-1.5 pt-2">
-                  <span className="text-[10px] font-mono uppercase text-[var(--ink-3)] block font-semibold">
-                    Source excerpt
-                  </span>
-                  <p className="font-serif text-xs text-[var(--ink)] bg-[var(--surface-2)] p-3 rounded-[6px] border border-[var(--line)] italic leading-relaxed">
-                    &ldquo;{selectedCitation.snippet}&rdquo;
-                  </p>
-                </div>
-              )}
-            </div>
-
-            <div className="pt-4 border-t border-[var(--line)] flex items-center justify-between">
-              {selectedCitation.url && (
-                <a
-                  href={selectedCitation.url}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="btn-secondary text-xs flex items-center gap-1.5"
-                >
-                  <span>Open source</span>
-                  <ExternalLink className="w-3.5 h-3.5" />
-                </a>
-              )}
-              <button
-                type="button"
-                onClick={() => setInspectorOpen(false)}
-                className="btn-primary text-xs"
-              >
-                Done
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      <CitationInspectorDrawer
+        citation={inspectorOpen ? selectedCitation : null}
+        onClose={() => setInspectorOpen(false)}
+      />
 
       {/* ─── Screen 7.8 Run Inspector Drawer ─────────────────────────── */}
       <RunInspectorDrawer
@@ -935,9 +589,13 @@ export default function ReportReaderPage({
         onClose={() => setRunInspectorOpen(false)}
         runId={reportId}
         token={token}
-        sources={report.sources || report.evidence_manifest || []}
+        sources={reportSources.map((source) => ({
+          ...source,
+          url: source.url || undefined,
+          authority_tier: source.authority_tier ?? undefined,
+        }))}
         findings={report.findings || []}
-        scores={scores}
+        scores={scores ?? undefined}
       />
     </div>
   );

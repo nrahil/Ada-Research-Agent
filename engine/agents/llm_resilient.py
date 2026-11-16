@@ -3,14 +3,12 @@
 """
 
 import time
-import json
 import threading
+import logging
 from typing import Optional, Dict, Any, List, Type
 from pydantic import BaseModel
 
 from engine.config import (
-    GROQ_API_KEY,
-    GEMINI_API_KEY,
     REDIS_URL,
     LLM_GROUPS,
     LLM_DEFAULT_RPM,
@@ -25,6 +23,8 @@ from packages.llm_gateway import (
     TokenBucketLimiter,
     ResponseCache
 )
+
+logger = logging.getLogger(__name__)
 
 def _get_redis_safe() -> Optional[Any]:
     """Connect to Redis for shared limits/cache, or return `None` on failure.
@@ -83,7 +83,8 @@ def call_gateway(
     json_mode: bool = False,
     timeout: float = 40.0,
     run_id: Optional[str] = None,
-    agent_name: Optional[str] = None
+    agent_name: Optional[str] = None,
+    persist_telemetry: bool = True,
 ) -> LLMResult:
     """Invoke the configured gateway, enforce run budgets, and record telemetry.
 
@@ -97,6 +98,8 @@ def call_gateway(
         timeout: Provider call timeout in seconds.
         run_id: Optional run used for budget checks, persistence and events.
         agent_name: Optional trace/audit label.
+        persist_telemetry: Write run-scoped database telemetry only for a
+            registered Ada run. Standalone evaluations can disable those writes.
 
     Returns:
         Full gateway result, including usage, error, degradation and cache data.
@@ -108,16 +111,26 @@ def call_gateway(
     global LAST_LLM_ERROR
     gateway = get_default_gateway()
     result = None
-    if run_id:
+    if run_id and persist_telemetry:
+        try:
+            from engine.celery_app import get_job_state
+            run_state = get_job_state(run_id) or {}
+            deadline_epoch = run_state.get("budget_deadline_epoch")
+            if deadline_epoch and time.time() >= float(deadline_epoch):
+                result = LLMResult(content="", group=group, degraded=True, error="Run time budget reached; no additional model request was sent.")
+        except Exception:
+            logger.warning("Could not read deadline state for run %s", run_id)
         try:
             from engine.storage.relational_store import RelationalStore
-            usage = RelationalStore.get_run_usage(run_id)
-            if usage["tokens_in"] + usage["tokens_out"] >= RUN_TOKEN_BUDGET:
-                result = LLMResult(content="", group=group, degraded=True, error=f"Run token budget of {RUN_TOKEN_BUDGET:,} tokens reached.")
-            elif RelationalStore.get_run_cost(run_id) >= RUN_COST_BUDGET_USD:
-                result = LLMResult(content="", group=group, degraded=True, error=f"Run cost budget of ${RUN_COST_BUDGET_USD:.2f} reached.")
-        except Exception as budget_error:
-            print(f"[llm] Budget check notice: {budget_error}")
+            if result is None:
+                usage = RelationalStore.get_run_usage(run_id)
+                recorded_tokens = usage["tokens_in"] + usage["tokens_out"]
+                if recorded_tokens >= RUN_TOKEN_BUDGET or recorded_tokens + max_tokens > RUN_TOKEN_BUDGET:
+                    result = LLMResult(content="", group=group, degraded=True, error=f"Run token budget of {RUN_TOKEN_BUDGET:,} tokens reached; no additional model request was sent.")
+                elif RelationalStore.get_run_cost(run_id) >= RUN_COST_BUDGET_USD:
+                    result = LLMResult(content="", group=group, degraded=True, error=f"Run cost budget of ${RUN_COST_BUDGET_USD:.2f} reached; no additional model request was sent.")
+        except Exception:
+            logger.warning("Could not read token or cost budget for run %s", run_id)
     if result is None:
         result = gateway.complete(
             group=group,
@@ -131,7 +144,7 @@ def call_gateway(
             agent_name=agent_name
         )
     LAST_LLM_ERROR = result.error
-    if run_id:
+    if run_id and persist_telemetry:
         try:
             from engine.storage.relational_store import RelationalStore
             from packages.llm_gateway.tracing import trace_id_for_run
@@ -166,8 +179,8 @@ def call_gateway(
                 "degraded": result.degraded,
                 "error": result.error,
             })
-        except Exception as telemetry_error:
-            print(f"[llm] Telemetry persistence notice: {telemetry_error}")
+        except Exception:
+            logger.warning("Could not persist LLM telemetry for run %s", run_id)
     return result
 
 

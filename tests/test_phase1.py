@@ -1,5 +1,6 @@
 import sys
 from pathlib import Path
+import pytest
 
 # Add project root to path
 ROOT = Path(__file__).resolve().parent.parent
@@ -9,6 +10,7 @@ from engine.agents.planner import generate_research_plan
 from engine.workers.research_worker import execute_sub_research
 from engine.tasks import run_research_pipeline_sync
 
+@pytest.mark.integration
 def test_phase1_parallel_pipeline():
     test_query = "Commercial viability of sodium ion batteries in electric vehicles by 2026"
 
@@ -30,8 +32,8 @@ def test_phase1_parallel_pipeline():
     assert worker_res["evidence_count"] > 0, "Research worker returned 0 evidence items"
 
     print("\n=== 3. TESTING FULL CONCURRENT RESEARCH FAN-OUT ===")
-    pipeline_res = run_research_pipeline_sync(test_query, depth="quick", max_workers=3)
-    print(f"\nPipeline completed:")
+    pipeline_res = run_research_pipeline_sync(test_query, depth="quick")
+    print("\nPipeline completed:")
     print(f"  Sub-tasks completed: {pipeline_res['sub_tasks_count']}")
     print(f"  Total distinct evidence units: {pipeline_res['total_evidence_units']}")
     assert pipeline_res["total_evidence_units"] >= 3, "Pipeline gathered insufficient evidence"
