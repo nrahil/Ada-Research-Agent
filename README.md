@@ -1,5 +1,11 @@
 # Ada Research Agent
 
+[![CI/CD Pipeline](https://github.com/nrahil/Ada-Research-Agent/actions/workflows/deploy.yml/badge.svg)](https://github.com/nrahil/Ada-Research-Agent/actions/workflows/deploy.yml)
+[![Python 3.12](https://img.shields.io/badge/Python-3.12-3776AB.svg?logo=python&logoColor=white)](https://python.org)
+[![Next.js 16](https://img.shields.io/badge/Next.js-16-black.svg?logo=next.js&logoColor=white)](https://nextjs.org)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.110+-009688.svg?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
+[![Docker](https://img.shields.io/badge/Docker-Compose-2496ED.svg?logo=docker&logoColor=white)](https://docker.com)
+
 Ada is a personal research workspace that turns a question into a source-grounded research report. It combines web search, a user's private document vault, a multi-stage agent pipeline, citation checks, and report follow-up grounded in the saved evidence. This manual describes the implementation in this repository; it does not imply service-level guarantees or independently validated research accuracy.
 
 ## Contents
